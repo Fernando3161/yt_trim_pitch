@@ -1,6 +1,7 @@
 """Tests for process_youtube_clip.py"""
 from __future__ import annotations
 
+import argparse
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -11,31 +12,136 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from process_youtube_clip import (
-    SEMITONE_DOWN_FACTOR,
-    TEMPO_COMPENSATION,
     capture_command,
     find_downloaded_file,
     get_audio_sample_rate,
     has_rubberband,
+    hz_ratio_to_pitch_factor,
+    process_audio_pitch,
     require_binary,
+    resolve_pitch_factor,
     run_command,
+    semitones_to_pitch_factor,
 )
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# semitones_to_pitch_factor
 # ---------------------------------------------------------------------------
 
-class TestConstants:
-    def test_semitone_down_factor_approx(self):
-        assert abs(SEMITONE_DOWN_FACTOR - 0.943874) < 1e-5
+class TestSemitonesToPitchFactor:
+    def test_minus_one_semitone(self):
+        factor = semitones_to_pitch_factor(-1)
+        assert abs(factor - 0.943874) < 1e-5
 
-    def test_tempo_compensation_approx(self):
-        assert abs(TEMPO_COMPENSATION - 1.059463) < 1e-5
+    def test_plus_one_semitone(self):
+        factor = semitones_to_pitch_factor(1)
+        assert abs(factor - 1.059463) < 1e-5
 
-    def test_factors_are_inverses(self):
-        """Shifting pitch down then compensating tempo should cancel out to ~1."""
-        assert abs(SEMITONE_DOWN_FACTOR * TEMPO_COMPENSATION - 1.0) < 1e-10
+    def test_zero_semitones_is_unity(self):
+        assert semitones_to_pitch_factor(0) == 1.0
+
+    def test_octave_down_is_half(self):
+        assert abs(semitones_to_pitch_factor(-12) - 0.5) < 1e-10
+
+    def test_octave_up_is_double(self):
+        assert abs(semitones_to_pitch_factor(12) - 2.0) < 1e-10
+
+    def test_up_down_same_magnitude_cancel(self):
+        """Shifting up then down by the same amount should give factor 1."""
+        factor = semitones_to_pitch_factor(3) * semitones_to_pitch_factor(-3)
+        assert abs(factor - 1.0) < 1e-10
+
+    def test_minus_one_and_plus_one_are_inverses(self):
+        """The -1 st factor and +1 st factor should multiply to 1."""
+        assert abs(semitones_to_pitch_factor(-1) * semitones_to_pitch_factor(1) - 1.0) < 1e-10
+
+    def test_fractional_semitones(self):
+        factor = semitones_to_pitch_factor(0.5)
+        assert 1.0 < factor < semitones_to_pitch_factor(1)
+
+
+# ---------------------------------------------------------------------------
+# hz_ratio_to_pitch_factor
+# ---------------------------------------------------------------------------
+
+class TestHzRatioToPitchFactor:
+    def test_a440_to_a450_shifts_up(self):
+        factor = hz_ratio_to_pitch_factor(reference_hz=440, target_hz=450)
+        assert factor > 1.0
+
+    def test_a450_to_a440_shifts_down(self):
+        factor = hz_ratio_to_pitch_factor(reference_hz=450, target_hz=440)
+        assert abs(factor - 440 / 450) < 1e-10
+
+    def test_same_frequency_is_unity(self):
+        assert hz_ratio_to_pitch_factor(440, 440) == 1.0
+
+    def test_raises_on_zero_reference(self):
+        with pytest.raises(ValueError, match="reference_hz must be positive"):
+            hz_ratio_to_pitch_factor(0, 440)
+
+    def test_raises_on_negative_reference(self):
+        with pytest.raises(ValueError, match="reference_hz must be positive"):
+            hz_ratio_to_pitch_factor(-10, 440)
+
+    def test_raises_on_zero_target(self):
+        with pytest.raises(ValueError, match="target_hz must be positive"):
+            hz_ratio_to_pitch_factor(440, 0)
+
+    def test_raises_on_negative_target(self):
+        with pytest.raises(ValueError, match="target_hz must be positive"):
+            hz_ratio_to_pitch_factor(440, -5)
+
+
+# ---------------------------------------------------------------------------
+# resolve_pitch_factor
+# ---------------------------------------------------------------------------
+
+class TestResolvePitchFactor:
+    def _make_parser(self):
+        """Return a minimal parser that mirrors the real one's dest names."""
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--semitones", type=float, default=None, dest="semitones")
+        parser.add_argument("--ref-hz", type=float, default=None)
+        parser.add_argument("--target-hz", type=float, default=None)
+        return parser
+
+    def test_default_is_minus_one_semitone(self):
+        parser = self._make_parser()
+        args = parser.parse_args([])
+        factor = resolve_pitch_factor(args, parser)
+        assert abs(factor - semitones_to_pitch_factor(-1)) < 1e-10
+
+    def test_explicit_semitones(self):
+        parser = self._make_parser()
+        args = parser.parse_args(["--semitones", "3"])
+        factor = resolve_pitch_factor(args, parser)
+        assert abs(factor - semitones_to_pitch_factor(3)) < 1e-10
+
+    def test_hz_mode(self):
+        parser = self._make_parser()
+        args = parser.parse_args(["--ref-hz", "450", "--target-hz", "440"])
+        factor = resolve_pitch_factor(args, parser)
+        assert abs(factor - hz_ratio_to_pitch_factor(450, 440)) < 1e-10
+
+    def test_mutual_exclusion_raises(self):
+        parser = self._make_parser()
+        args = parser.parse_args(["--semitones", "-1", "--ref-hz", "450", "--target-hz", "440"])
+        with pytest.raises(SystemExit):
+            resolve_pitch_factor(args, parser)
+
+    def test_missing_target_hz_raises(self):
+        parser = self._make_parser()
+        args = parser.parse_args(["--ref-hz", "450"])
+        with pytest.raises(SystemExit):
+            resolve_pitch_factor(args, parser)
+
+    def test_missing_ref_hz_raises(self):
+        parser = self._make_parser()
+        args = parser.parse_args(["--target-hz", "440"])
+        with pytest.raises(SystemExit):
+            resolve_pitch_factor(args, parser)
 
 
 # ---------------------------------------------------------------------------
@@ -169,3 +275,74 @@ class TestGetAudioSampleRate:
         with patch("process_youtube_clip.capture_command", return_value=""):
             with pytest.raises(RuntimeError, match="Could not read audio sample rate"):
                 get_audio_sample_rate(fake_file)
+
+
+# ---------------------------------------------------------------------------
+# process_audio_pitch
+# ---------------------------------------------------------------------------
+
+class TestProcessAudioPitch:
+    def _fake_file(self, tmp_path) -> Path:
+        f = tmp_path / "input.mp4"
+        f.write_text("")
+        return f
+
+    def test_uses_rubberband_filter_when_available(self, tmp_path):
+        input_file = self._fake_file(tmp_path)
+        output_file = tmp_path / "out.mp4"
+        pitch_factor = semitones_to_pitch_factor(-1)
+
+        with patch("process_youtube_clip.has_rubberband", return_value=True), \
+             patch("process_youtube_clip.run_command") as mock_run:
+            process_audio_pitch(input_file, output_file, pitch_factor)
+
+        cmd = mock_run.call_args[0][0]
+        af_value = cmd[cmd.index("-af") + 1]
+        assert "rubberband" in af_value
+        assert f"{pitch_factor:.6f}" in af_value
+
+    def test_uses_fallback_filter_when_no_rubberband(self, tmp_path):
+        input_file = self._fake_file(tmp_path)
+        output_file = tmp_path / "out.mp4"
+        pitch_factor = semitones_to_pitch_factor(-1)
+
+        with patch("process_youtube_clip.has_rubberband", return_value=False), \
+             patch("process_youtube_clip.get_audio_sample_rate", return_value=44100), \
+             patch("process_youtube_clip.run_command") as mock_run:
+            process_audio_pitch(input_file, output_file, pitch_factor)
+
+        cmd = mock_run.call_args[0][0]
+        af_value = cmd[cmd.index("-af") + 1]
+        assert "asetrate" in af_value
+        assert "aresample" in af_value
+        assert "atempo" in af_value
+
+    def test_tempo_compensation_is_inverse_of_pitch_factor(self, tmp_path):
+        """atempo value should equal 1/pitch_factor to preserve tempo."""
+        input_file = self._fake_file(tmp_path)
+        output_file = tmp_path / "out.mp4"
+        pitch_factor = semitones_to_pitch_factor(3)
+        expected_tempo = 1.0 / pitch_factor
+
+        with patch("process_youtube_clip.has_rubberband", return_value=False), \
+             patch("process_youtube_clip.get_audio_sample_rate", return_value=48000), \
+             patch("process_youtube_clip.run_command") as mock_run:
+            process_audio_pitch(input_file, output_file, pitch_factor)
+
+        cmd = mock_run.call_args[0][0]
+        af_value = cmd[cmd.index("-af") + 1]
+        assert f"{expected_tempo:.6f}" in af_value
+
+    def test_hz_ratio_pitch_factor_rubberband(self, tmp_path):
+        """Using hz_ratio_to_pitch_factor result produces correct rubberband filter."""
+        input_file = self._fake_file(tmp_path)
+        output_file = tmp_path / "out.mp4"
+        pitch_factor = hz_ratio_to_pitch_factor(450, 440)
+
+        with patch("process_youtube_clip.has_rubberband", return_value=True), \
+             patch("process_youtube_clip.run_command") as mock_run:
+            process_audio_pitch(input_file, output_file, pitch_factor)
+
+        cmd = mock_run.call_args[0][0]
+        af_value = cmd[cmd.index("-af") + 1]
+        assert f"{pitch_factor:.6f}" in af_value

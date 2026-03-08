@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_process_youtube_clip.py -v)",
+      "Bash(pip install pytest -q)"
+    ]
+  }
+}

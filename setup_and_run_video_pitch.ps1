@@ -7,8 +7,25 @@ $VideoUrl = 'PASTE_YOUR_VIDEO_URL_HERE'
 $StartTime = '00:00:00'
 $EndTime = '00:02:00'
 $OutputFileName = 'clip_medio_tono_abajo.mp4'
-$ClipBaseName = 'clip'
 $RequirementsFileName = 'requirements.txt'
+
+# ---------------------------------------------------------------------------
+# Pitch shift — set ONE of the two options below and leave the other $null.
+#
+#   Option A: semitones
+#     $Semitones = -1   → one semitone down  (default, standard behaviour)
+#     $Semitones = +3   → three semitones up
+#     $Semitones = -2   → two semitones down
+#
+#   Option B: Hz ratio  (detected pitch in video → desired pitch)
+#     $RefHz    = 450
+#     $TargetHz = 440
+#
+# If both options are left at their defaults, the script uses -1 semitone.
+# ---------------------------------------------------------------------------
+$Semitones = -1     # set to $null to use Option B instead
+$RefHz = $null
+$TargetHz = $null
 
 function Write-Step {
     param([string]$Message)
@@ -250,93 +267,51 @@ function Ensure-FFmpegInstalledAndOnPath {
     Write-Host "ffprobe available at: $($ffprobeCmd.Source)" -ForegroundColor Green
 }
 
-function Get-ClipFile {
-    param([string]$Directory, [string]$BaseName)
+function Build-PitchArgs {
+    param(
+        [object]$Semitones,
+        [object]$RefHz,
+        [object]$TargetHz
+    )
 
-    $matches = Get-ChildItem -Path $Directory -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.BaseName -eq $BaseName } |
-        Sort-Object LastWriteTime -Descending
-
-    return $matches | Select-Object -First 1
-}
-
-function Test-FFmpegHasRubberband {
-    $output = & ffmpeg -hide_banner -filters 2>&1
-    return ($output | Select-String -Pattern 'rubberband' -Quiet)
-}
-
-function Get-AudioSampleRate {
-    param([string]$InputFile)
-
-    $sampleRate = & ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of default=nokey=1:noprint_wrappers=1 $InputFile 2>$null
-    if (-not $sampleRate) {
-        throw 'Could not determine the input audio sample rate with ffprobe.'
+    if ($null -ne $RefHz -and $null -ne $TargetHz) {
+        return @('--ref-hz', [string]$RefHz, '--target-hz', [string]$TargetHz)
     }
 
-    return [int]($sampleRate | Select-Object -First 1)
+    $st = if ($null -ne $Semitones) { $Semitones } else { -1 }
+    return @('--semitones', [string]$st)
 }
 
 function Invoke-VideoProcessing {
     param(
         [string]$TargetEnv,
-        [string]$WorkDir,
+        [string]$ScriptDir,
         [string]$Video,
         [string]$Start,
         [string]$End,
-        [string]$ClipBase,
-        [string]$OutputName
+        [string]$OutputName,
+        [string[]]$PitchArgs
     )
 
     if ([string]::IsNullOrWhiteSpace($Video) -or $Video -eq 'PASTE_YOUR_VIDEO_URL_HERE') {
         Fail 'Please edit the script and replace PASTE_YOUR_VIDEO_URL_HERE with your actual YouTube URL.'
     }
 
-    Push-Location $WorkDir
-    try {
-        Write-Step 'Downloading the selected video section'
-        Get-ChildItem -Path $WorkDir -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.BaseName -eq $ClipBase -or $_.Name -eq $OutputName } |
-            Remove-Item -Force -ErrorAction SilentlyContinue
+    $scriptPath = Join-Path $ScriptDir 'process_youtube_clip.py'
+    $outputPath = Join-Path $ScriptDir $OutputName
 
-        Invoke-Conda -Arguments @(
-            'run', '-n', $TargetEnv,
-            'python', '-m', 'yt_dlp',
-            '-f', 'bv*+ba/b',
-            '--merge-output-format', 'mp4',
-            '--force-keyframes-at-cuts',
-            '--download-sections', "*$Start-$End",
-            '-o', (Join-Path $WorkDir "$ClipBase.%(ext)s"),
-            $Video
-        )
+    Write-Step 'Downloading and processing the video clip'
 
-        $clip = Get-ClipFile -Directory $WorkDir -BaseName $ClipBase
-        if (-not $clip) {
-            Fail 'The clip file could not be found after download.'
-        }
+    Invoke-Conda -Arguments (@(
+        'run', '-n', $TargetEnv,
+        'python', $scriptPath,
+        $Video,
+        '--start', $Start,
+        '--end', $End,
+        '--output', $outputPath
+    ) + $PitchArgs)
 
-        $outputPath = Join-Path $WorkDir $OutputName
-        Write-Step 'Lowering the audio pitch by one semitone'
-
-        if (Test-FFmpegHasRubberband) {
-            & ffmpeg -y -i $clip.FullName -c:v copy -af 'rubberband=pitch=0.943874:formant=preserved' -c:a aac -b:a 192k $outputPath
-            if ($LASTEXITCODE -ne 0) {
-                throw 'ffmpeg failed while using the rubberband filter.'
-            }
-        }
-        else {
-            $sampleRate = Get-AudioSampleRate -InputFile $clip.FullName
-            $audioFilter = "asetrate=$sampleRate*0.943874,aresample=$sampleRate,atempo=1.059463"
-            & ffmpeg -y -i $clip.FullName -c:v copy -af $audioFilter -c:a aac -b:a 192k $outputPath
-            if ($LASTEXITCODE -ne 0) {
-                throw 'ffmpeg failed while using the fallback pitch-shift filter chain.'
-            }
-        }
-
-        Write-Host "Output written to: $outputPath" -ForegroundColor Green
-    }
-    finally {
-        Pop-Location
-    }
+    Write-Host "Output written to: $outputPath" -ForegroundColor Green
 }
 
 Ensure-Admin
@@ -357,6 +332,15 @@ Ensure-PipAndRequirements -TargetEnv $TargetEnvName -RequirementsFile $requireme
 
 Ensure-FFmpegInstalledAndOnPath
 
-Invoke-VideoProcessing -TargetEnv $TargetEnvName -WorkDir $scriptDir -Video $VideoUrl -Start $StartTime -End $EndTime -ClipBase $ClipBaseName -OutputName $OutputFileName
+$pitchArgs = Build-PitchArgs -Semitones $Semitones -RefHz $RefHz -TargetHz $TargetHz
+
+Invoke-VideoProcessing `
+    -TargetEnv $TargetEnvName `
+    -ScriptDir $scriptDir `
+    -Video $VideoUrl `
+    -Start $StartTime `
+    -End $EndTime `
+    -OutputName $OutputFileName `
+    -PitchArgs $pitchArgs
 
 Write-Host "`nAll steps completed successfully." -ForegroundColor Green
